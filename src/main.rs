@@ -8,6 +8,13 @@ use std::process::{Command, Stdio};
 use log::{error, info, log, warn};
 use env_logger::Env;
 use std::net::UdpSocket;
+use serde_json;
+use bytes::Bytes;
+use ollama_rs::Ollama;
+use ollama_rs::generation::completion::request::GenerationRequest;
+use futures::StreamExt;
+use async_stream::try_stream;
+use std::collections::HashMap;
 
 const APP_PORTS: &[u16] = &[8084]; // Add any other ports your application uses
 
@@ -28,13 +35,23 @@ fn get_local_ip() -> Option<String> {
     }
 }
 
+// Helper function to adjust command for Windows.
+fn get_command(command: &str) -> Command {
+    let cmd = if cfg!(target_os = "windows") {
+        format!("{}.exe", command)
+    } else {
+        command.to_string()
+    };
+    Command::new(cmd)
+}
+
 fn get_open_ports(ip: &str) -> Result<Vec<u16>, String> {
     let local_ip = get_local_ip().unwrap_or("unknown".to_string());
     let is_local = ip == local_ip || ip == "127.0.0.1" || ip == "localhost";
     let target_ip = if is_local { "127.0.0.1" } else { ip };
     
     info!("Executing rustscan on IP: {}", target_ip);
-    let output_rustscan = Command::new("rustscan")
+    let output_rustscan = get_command("rustscan")
         .arg("-a")
         .arg(target_ip)
         .arg("-g")
@@ -84,7 +101,7 @@ fn scan_open_ports(ip: &str, ports: &[u16]) -> Result<String, String> {
     let ports_str = ports.iter().map(|p| p.to_string()).collect::<Vec<String>>().join(",");
     info!("Executing nmap scan on IP: {} for ports: {}", target_ip, ports_str);
 
-    let output_nmap = Command::new("nmap")
+    let output_nmap = get_command("nmap")
         .arg("-A")
         .arg(target_ip)
         .arg("-p")
@@ -228,7 +245,7 @@ fn scan_network(cidr: &str) -> Result<Vec<String>, String> {
     let local_ip = get_local_ip().unwrap_or("unknown".to_string());
     info!("Local IP address: {}", local_ip);
     info!("Executing network scan on CIDR range: {}", cidr);
-    let output = Command::new("nmap")
+    let output = get_command("nmap")
         .arg("-sn")  // Ping scan
         .arg("-n")   // No DNS resolution
         .arg(cidr)
@@ -273,18 +290,90 @@ async fn discover_hosts(cidr: web::Path<String>) -> impl Responder {
     }
 }
 
+
+// New struct for handling question requests
+#[derive(Deserialize)]
+struct QuestionRequest {
+    question: String,
+}
+
+// New function that returns a streaming response from Ollama
+async fn ask_openai_stream(
+    ollama: &Ollama,
+    question: &str,
+) -> Result<impl futures::Stream<Item = Result<String, Box<dyn std::error::Error>>>, Box<dyn std::error::Error>> {
+    let model = "deepseek-r1:1.5b".to_string();
+    let request = GenerationRequest::new(model, question.to_string());
+    let response_stream = ollama.generate_stream(request).await?;
+    let stream = try_stream! {
+        futures::pin_mut!(response_stream);
+        while let Some(chunk_result) = response_stream.next().await {
+            match chunk_result {
+                Ok(responses) => {
+                    for response in responses {
+                        yield response.response;
+                    }
+                }
+                Err(e) => Err(Box::new(e))?,
+            }
+        }
+    };
+    Ok(stream)
+}
+
+// Updated ask_openai route handler to stream output
+async fn ask_openai(ollama: web::Data<Ollama>, req: web::Json<QuestionRequest>) -> impl Responder {
+    match ask_openai_stream(ollama.get_ref(), &req.question).await {
+        Ok(stream) => {
+            let byte_stream = stream.map(|chunk_result| chunk_result.map(Bytes::from));
+            HttpResponse::Ok().streaming(byte_stream)
+        },
+        Err(e) => HttpResponse::InternalServerError().body(format!("Error: {}", e)),
+    }
+}
+
+// Updated endpoint to check if all tools are installed with JSON output and detailed logs.
+async fn check_tools() -> impl Responder {
+    let tools = ["rustscan", "nmap", "ollama"];
+    let mut results: std::collections::HashMap<String, bool> = std::collections::HashMap::new();
+
+    info!("Starting tool checks...");
+    for tool in tools.iter() {
+        info!("Checking tool: {}", tool);
+        let ok = get_command(tool)
+            .arg("--version")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or_else(|e| {
+                error!("Error executing {}: {}", tool, e);
+                false
+            });
+        info!("Tool {} installed: {}", tool, ok);
+        results.insert(tool.to_string(), ok);
+    }
+    info!("All tool checks completed.");
+    HttpResponse::Ok().json(results)
+}
+
 #[actix_web::main]
 async fn main() -> std::io::Result<()> {
     env_logger::Builder::from_env(Env::default().default_filter_or("info"))
         .format_timestamp_secs()
         .init();
 
+    // Initialize Ollama instance once during server startup
+    let ollama_instance = Ollama::default();
+    let ollama_data = web::Data::new(ollama_instance);
+
     let local_ip = get_local_ip().unwrap_or("127.0.0.1".to_string());
     info!("Server running on machine with IP: {}", local_ip);
     info!("Starting server at http://127.0.0.1:{}", APP_PORTS[0]);
     
-    HttpServer::new(|| {
+    HttpServer::new(move || {
         App::new()
+            .app_data(ollama_data.clone())
             // Add middleware
             .wrap(Logger::default())
             .wrap(Logger::new("%a %r %s %b %{Referer}i %{User-Agent}i %T"))
@@ -308,6 +397,8 @@ async fn main() -> std::io::Result<()> {
             // Routes
             .route("/scan/{ip}", web::get().to(scan))
             .route("/discover/{cidr}", web::get().to(discover_hosts))
+            .route("/ask", web::post().to(ask_openai))
+            .route("/tools", web::get().to(check_tools))
     })
     .bind(format!("127.0.0.1:{}", APP_PORTS[0]))?
     .run()
