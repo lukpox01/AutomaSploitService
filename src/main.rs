@@ -10,11 +10,13 @@ use env_logger::Env;
 use std::net::UdpSocket;
 use serde_json;
 use bytes::Bytes;
+// Comment out Ollama imports
 use ollama_rs::Ollama;
 use ollama_rs::generation::completion::request::GenerationRequest;
 use futures::StreamExt;
 use async_stream::try_stream;
 use std::collections::HashMap;
+use tokio::net::TcpStream;
 
 const APP_PORTS: &[u16] = &[8084]; // Add any other ports your application uses
 
@@ -291,71 +293,139 @@ async fn discover_hosts(cidr: web::Path<String>) -> impl Responder {
 }
 
 
-// New struct for handling question requests
-#[derive(Deserialize)]
+// Simplified question request struct
+#[derive(Debug, Deserialize)]
 struct QuestionRequest {
     question: String,
 }
 
-// New function that returns a streaming response from Ollama
-async fn ask_openai_stream(
-    ollama: &Ollama,
-    question: &str,
-) -> Result<impl futures::Stream<Item = Result<String, Box<dyn std::error::Error>>>, Box<dyn std::error::Error>> {
-    let model = "deepseek-r1:1.5b".to_string();
-    let request = GenerationRequest::new(model, question.to_string());
-    let response_stream = ollama.generate_stream(request).await?;
-    let stream = try_stream! {
-        futures::pin_mut!(response_stream);
-        while let Some(chunk_result) = response_stream.next().await {
-            match chunk_result {
-                Ok(responses) => {
-                    for response in responses {
-                        yield response.response;
-                    }
-                }
-                Err(e) => Err(Box::new(e))?,
-            }
-        }
-    };
-    Ok(stream)
-}
-
-// Updated ask_openai route handler to stream output
+// Modified ask_openai handler
 async fn ask_openai(ollama: web::Data<Ollama>, req: web::Json<QuestionRequest>) -> impl Responder {
-    match ask_openai_stream(ollama.get_ref(), &req.question).await {
-        Ok(stream) => {
-            let byte_stream = stream.map(|chunk_result| chunk_result.map(Bytes::from));
-            HttpResponse::Ok().streaming(byte_stream)
+    info!("Received question: {}", req.question);
+
+    if req.question.is_empty() {
+        return HttpResponse::BadRequest().json(serde_json::json!({
+            "error": "Question cannot be empty"
+        }));
+    }
+
+    let model = "qwen2.5:3b".to_string();
+    let request = GenerationRequest::new(model, req.question.clone());
+
+    match ollama.generate(request).await {
+        Ok(response) => {
+            HttpResponse::Ok().json(serde_json::json!({
+                "text": response.response
+            }))
         },
-        Err(e) => HttpResponse::InternalServerError().body(format!("Error: {}", e)),
+        Err(e) => {
+            error!("Error in ask_openai: {}", e);
+            HttpResponse::InternalServerError().json(serde_json::json!({
+                "error": format!("Failed to process question: {}", e)
+            }))
+        },
     }
 }
 
 // Updated endpoint to check if all tools are installed with JSON output and detailed logs.
-async fn check_tools() -> impl Responder {
-    let tools = ["rustscan", "nmap", "ollama"];
-    let mut results: std::collections::HashMap<String, bool> = std::collections::HashMap::new();
+#[derive(Debug, Serialize)]
+struct ToolStatus {
+    installed: bool,
+    running: bool,
+}
 
-    info!("Starting tool checks...");
-    for tool in tools.iter() {
+async fn check_tools() -> impl Responder {
+    let mut results: HashMap<String, ToolStatus> = HashMap::new();
+    
+    // Check rustscan and nmap first
+    for tool in ["rustscan", "nmap"].iter() {
         info!("Checking tool: {}", tool);
-        let ok = get_command(tool)
+        let installed = get_command(tool)
             .arg("--version")
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .output()
             .map(|o| o.status.success())
-            .unwrap_or_else(|e| {
-                error!("Error executing {}: {}", tool, e);
-                false
-            });
-        info!("Tool {} installed: {}", tool, ok);
-        results.insert(tool.to_string(), ok);
+            .unwrap_or(false);
+            
+        info!("Tool {} installed: {}", tool, installed);
+        results.insert(tool.to_string(), ToolStatus {
+            installed,
+            running: true,
+        });
     }
-    info!("All tool checks completed.");
+
+    info!("Skipping Ollama running check.");
+
+    // We'll still do the installation check, but not the 'is_running' test
+    let ollama_installed = get_command("ollama")
+        .arg("--version")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false);
+
+    let ollama_running = false;
+
+    results.insert("ollama".to_string(), ToolStatus {
+        installed: ollama_installed,
+        running: ollama_running,
+    });
+
     HttpResponse::Ok().json(results)
 }
+
+// Add these structs after the existing ones
+#[derive(Debug, Serialize, Deserialize)]
+struct OpenRouterPricing {
+    prompt: f64,
+    completion: f64,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct OpenRouterModel {
+    id: String,
+    name: String,
+    description: String,
+    pricing: OpenRouterPricing,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct OpenRouterModelsResponse {
+    data: Vec<OpenRouterModel>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct ChatMessage {
+    role: String,
+    content: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct ChatRequest {
+    model: String,
+    messages: Vec<ChatMessage>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct ChatResponseMessage {
+    role: String,
+    content: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct ChatResponseChoice {
+    message: ChatResponseMessage,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct ChatResponse {
+    id: String,
+    choices: Vec<ChatResponseChoice>,
+}
+
+// Add these new handler functions before main()
 
 #[actix_web::main]
 async fn main() -> std::io::Result<()> {
@@ -363,7 +433,6 @@ async fn main() -> std::io::Result<()> {
         .format_timestamp_secs()
         .init();
 
-    // Initialize Ollama instance once during server startup
     let ollama_instance = Ollama::default();
     let ollama_data = web::Data::new(ollama_instance);
 
@@ -381,18 +450,6 @@ async fn main() -> std::io::Result<()> {
                 DefaultHeaders::new()
                     .add(("X-Version", "1.0.0"))
                     .add(("Content-Type", "application/json"))
-            )
-            // Configure request timeouts and limits
-            .app_data(web::JsonConfig::default()
-                .limit(4096) // limiting request payload size
-                .error_handler(|err, _| {
-                    error!("JSON error: {:?}", err);
-                    actix_web::error::InternalError::from_response(
-                        err,
-                        HttpResponse::BadRequest()
-                            .json("Invalid JSON payload")
-                    ).into()
-                })
             )
             // Routes
             .route("/scan/{ip}", web::get().to(scan))
