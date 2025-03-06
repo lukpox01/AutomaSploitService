@@ -309,7 +309,7 @@ async fn ask_openai(ollama: web::Data<Ollama>, req: web::Json<QuestionRequest>) 
         }));
     }
 
-    let model = "qwen2.5:3b".to_string();
+    let model = "deepseek-r1:1.5b".to_string();
     let request = GenerationRequest::new(model, req.question.clone());
 
     match ollama.generate(request).await {
