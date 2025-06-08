@@ -10,9 +10,7 @@ use env_logger::Env;
 use std::net::UdpSocket;
 use serde_json;
 use bytes::Bytes;
-// Comment out Ollama imports
-use ollama_rs::Ollama;
-use ollama_rs::generation::completion::request::GenerationRequest;
+use reqwest::Client;
 use futures::StreamExt;
 use async_stream::try_stream;
 use std::collections::HashMap;
@@ -293,14 +291,41 @@ async fn discover_hosts(cidr: web::Path<String>) -> impl Responder {
 }
 
 
+// OpenRouter API structures
+#[derive(Debug, Serialize, Deserialize)]
+struct OpenRouterMessage {
+    role: String,
+    content: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct OpenRouterRequest {
+    model: String,
+    messages: Vec<OpenRouterMessage>,
+    temperature: Option<f32>,
+    max_tokens: Option<u32>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct OpenRouterChoice {
+    message: OpenRouterMessage,
+    finish_reason: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct OpenRouterResponse {
+    id: String,
+    choices: Vec<OpenRouterChoice>,
+}
+
 // Simplified question request struct
 #[derive(Debug, Deserialize)]
 struct QuestionRequest {
     question: String,
 }
 
-// Modified ask_openai handler
-async fn ask_openai(ollama: web::Data<Ollama>, req: web::Json<QuestionRequest>) -> impl Responder {
+// Modified ask_openai handler to use OpenRouter
+async fn ask_openai(client: web::Data<Client>, req: web::Json<QuestionRequest>) -> impl Responder {
     info!("Received question: {}", req.question);
 
     if req.question.is_empty() {
@@ -309,21 +334,75 @@ async fn ask_openai(ollama: web::Data<Ollama>, req: web::Json<QuestionRequest>) 
         }));
     }
 
-    let model = "deepseek-r1:1.5b".to_string();
-    let request = GenerationRequest::new(model, req.question.clone());
+    // Get OpenRouter API key from environment variable
+    let api_key = match std::env::var("OPENROUTER_API_KEY") {
+        Ok(key) => key,
+        Err(_) => {
+            error!("OPENROUTER_API_KEY environment variable not set");
+            return HttpResponse::InternalServerError().json(serde_json::json!({
+                "error": "OpenRouter API key not configured"
+            }));
+        }
+    };
 
-    match ollama.generate(request).await {
+    let openrouter_request = OpenRouterRequest {
+        model: "deepseek/deepseek-r1".to_string(), // Using DeepSeek R1 on OpenRouter
+        messages: vec![
+            OpenRouterMessage {
+                role: "user".to_string(),
+                content: req.question.clone(),
+            }
+        ],
+        temperature: Some(0.7),
+        max_tokens: Some(2048),
+    };
+
+    match client
+        .post("https://openrouter.ai/api/v1/chat/completions")
+        .header("Authorization", "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")
+        .header("HTTP-Referer", "http://localhost:8084") 
+        .header("X-Title", "AutomaSploitService")
+        .json(&openrouter_request)
+        .send()
+        .await
+    {
         Ok(response) => {
-            HttpResponse::Ok().json(serde_json::json!({
-                "text": response.response
-            }))
-        },
+            if response.status().is_success() {
+                match response.json::<OpenRouterResponse>().await {
+                    Ok(openrouter_response) => {
+                        if let Some(choice) = openrouter_response.choices.first() {
+                            HttpResponse::Ok().json(serde_json::json!({
+                                "text": choice.message.content
+                            }))
+                        } else {
+                            error!("No choices in OpenRouter response");
+                            HttpResponse::InternalServerError().json(serde_json::json!({
+                                "error": "No response content from OpenRouter"
+                            }))
+                        }
+                    }
+                    Err(e) => {
+                        error!("Failed to parse OpenRouter response: {}", e);
+                        HttpResponse::InternalServerError().json(serde_json::json!({
+                            "error": format!("Failed to parse response: {}", e)
+                        }))
+                    }
+                }
+            } else {
+                error!("OpenRouter API error: {}", response.status());
+                let error_text = response.text().await.unwrap_or_else(|_| "Unknown error".to_string());
+                error!("OpenRouter error details: {}", error_text);
+                HttpResponse::InternalServerError().json(serde_json::json!({
+                    "error": format!("OpenRouter API error: {}", error_text)
+                }))
+            }
+        }
         Err(e) => {
-            error!("Error in ask_openai: {}", e);
+            error!("Error calling OpenRouter API: {}", e);
             HttpResponse::InternalServerError().json(serde_json::json!({
-                "error": format!("Failed to process question: {}", e)
+                "error": format!("Failed to call OpenRouter API: {}", e)
             }))
-        },
+        }
     }
 }
 
@@ -433,8 +512,9 @@ async fn main() -> std::io::Result<()> {
         .format_timestamp_secs()
         .init();
 
-    let ollama_instance = Ollama::default();
-    let ollama_data = web::Data::new(ollama_instance);
+    // Create HTTP client for OpenRouter API calls
+    let client = Client::new();
+    let client_data = web::Data::new(client);
 
     let local_ip = get_local_ip().unwrap_or("127.0.0.1".to_string());
     info!("Server running on machine with IP: {}", local_ip);
@@ -442,7 +522,7 @@ async fn main() -> std::io::Result<()> {
     
     HttpServer::new(move || {
         App::new()
-            .app_data(ollama_data.clone())
+            .app_data(client_data.clone())
             // Add middleware
             .wrap(Logger::default())
             .wrap(Logger::new("%a %r %s %b %{Referer}i %{User-Agent}i %T"))
